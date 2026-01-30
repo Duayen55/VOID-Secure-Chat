@@ -2,11 +2,11 @@ pub mod discovery;
 pub mod swarm;
 pub mod utils;
 
+use crate::network::swarm::{SignalingRequest, SignalingResponse, VoidEvent};
+use libp2p::{Multiaddr, PeerId, futures::StreamExt, swarm::SwarmEvent};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, oneshot};
-use tauri::{State, AppHandle, Emitter};
-use libp2p::{PeerId, Multiaddr, futures::StreamExt, swarm::SwarmEvent};
-use crate::network::swarm::{VoidEvent, SignalingRequest, SignalingResponse};
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 // Command enum to send instructions to the swarm task
 #[derive(Debug)]
@@ -31,12 +31,18 @@ impl NetworkState {
 }
 
 #[tauri::command]
-pub async fn send_signal(peer_id: String, payload: String, state: State<'_, NetworkState>) -> Result<(), String> {
+pub async fn send_signal(
+    peer_id: String,
+    payload: String,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
     let peer_id = peer_id.parse::<PeerId>().map_err(|e| e.to_string())?;
     let sender_guard = state.sender.lock().await;
-    
+
     if let Some(tx) = sender_guard.as_ref() {
-        tx.send(NetworkCommand::SendSignal(peer_id, payload)).await.map_err(|e| e.to_string())?;
+        tx.send(NetworkCommand::SendSignal(peer_id, payload))
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     } else {
         Err("Node not running".into())
@@ -58,7 +64,7 @@ pub async fn start_node(state: State<'_, NetworkState>, app: AppHandle) -> Resul
         match swarm::build_swarm().await {
             Ok(mut swarm) => {
                 println!("Swarm initialized successfully");
-                
+
                 // Main Event Loop
                 loop {
                     tokio::select! {
@@ -91,7 +97,7 @@ pub async fn start_node(state: State<'_, NetworkState>, app: AppHandle) -> Resul
                                 }
                             }
                         }
-                        
+
                         // Handle Swarm Events
                         event = swarm.select_next_some() => {
                             match event {
@@ -152,9 +158,11 @@ pub async fn start_node(state: State<'_, NetworkState>, app: AppHandle) -> Resul
 pub async fn dial_peer(peer_id: String, state: State<'_, NetworkState>) -> Result<(), String> {
     let peer_id = peer_id.parse::<PeerId>().map_err(|e| e.to_string())?;
     let sender_guard = state.sender.lock().await;
-    
+
     if let Some(tx) = sender_guard.as_ref() {
-        tx.send(NetworkCommand::Dial(peer_id)).await.map_err(|e| e.to_string())?;
+        tx.send(NetworkCommand::Dial(peer_id))
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     } else {
         Err("Node not running".into())
@@ -165,9 +173,11 @@ pub async fn dial_peer(peer_id: String, state: State<'_, NetworkState>) -> Resul
 pub async fn connect_via_code(code: String, state: State<'_, NetworkState>) -> Result<(), String> {
     let multiaddr = utils::parse_void_code(&code)?;
     let sender_guard = state.sender.lock().await;
-    
+
     if let Some(tx) = sender_guard.as_ref() {
-        tx.send(NetworkCommand::DialAddress(multiaddr)).await.map_err(|e| e.to_string())?;
+        tx.send(NetworkCommand::DialAddress(multiaddr))
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     } else {
         Err("Node not running".into())
@@ -178,31 +188,34 @@ pub async fn connect_via_code(code: String, state: State<'_, NetworkState>) -> R
 pub async fn get_my_void_code(state: State<'_, NetworkState>) -> Result<String, String> {
     let (tx, rx) = oneshot::channel();
     let sender_guard = state.sender.lock().await;
-    
+
     if let Some(sender) = sender_guard.as_ref() {
-        sender.send(NetworkCommand::GetIdentity(tx)).await.map_err(|e| e.to_string())?;
-        
+        sender
+            .send(NetworkCommand::GetIdentity(tx))
+            .await
+            .map_err(|e| e.to_string())?;
+
         let (peer_id, addrs) = rx.await.map_err(|e| e.to_string())?;
-        
+
         // Find a suitable IP and Port
         // Logic: Look for non-local IP if possible.
         // If listeners are 0.0.0.0, we can't really use that for the code unless we resolve local IP.
         // But for now, let's try to find a valid IP.
-        
+
         let mut best_ip = "127.0.0.1".to_string();
         let mut best_port = 0;
-        
+
         for addr in addrs {
             let mut ip = None;
             let mut port = None;
-            
+
             for protocol in addr.iter() {
                 match protocol {
                     libp2p::multiaddr::Protocol::Ip4(i) => {
                         if !i.is_loopback() && !i.is_unspecified() {
                             ip = Some(i.to_string());
                         } else if i.is_loopback() {
-                             // keep loopback if nothing else
+                            // keep loopback if nothing else
                         }
                     }
                     libp2p::multiaddr::Protocol::Udp(p) => port = Some(p),
@@ -210,7 +223,7 @@ pub async fn get_my_void_code(state: State<'_, NetworkState>) -> Result<String, 
                     _ => {}
                 }
             }
-            
+
             if let (Some(i), Some(p)) = (ip, port) {
                 best_ip = i;
                 best_port = p;
@@ -220,7 +233,7 @@ pub async fn get_my_void_code(state: State<'_, NetworkState>) -> Result<String, 
                 }
             }
         }
-        
+
         Ok(utils::generate_void_code(peer_id, &best_ip, best_port))
     } else {
         Err("Node not running".into())

@@ -1,5 +1,5 @@
 use libp2p::kad::{Behaviour as Kademlia, Event as KademliaEvent, store::MemoryStore};
-use libp2p::mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent};
+use libp2p::mdns::{Event as MdnsEvent, tokio::Behaviour as Mdns};
 use libp2p::swarm::NetworkBehaviour;
 
 #[derive(NetworkBehaviour)]

@@ -1,20 +1,14 @@
 use super::discovery::{DiscoveryBehaviour, DiscoveryEvent};
-use libp2p::{
-    gossipsub,
-    autonat,
-    relay,
-    identify,
-    dcutr,
-    ping,
-    request_response::{self, ProtocolSupport},
-    SwarmBuilder,
-    swarm::NetworkBehaviour,
-    noise, tcp, yamux, PeerId, Multiaddr,
-};
-use std::time::Duration;
 use anyhow::Result;
-use std::str::FromStr;
+use libp2p::{
+    Multiaddr, PeerId, SwarmBuilder, autonat, dcutr, gossipsub, identify, noise, ping, relay,
+    request_response::{self, ProtocolSupport},
+    swarm::NetworkBehaviour,
+    tcp, yamux,
+};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalingRequest(pub String);
@@ -98,7 +92,7 @@ impl From<request_response::Event<SignalingRequest, SignalingResponse>> for Void
 pub async fn build_swarm() -> Result<libp2p::Swarm<VoidBehaviour>> {
     let local_key = libp2p::identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
-    
+
     println!("Local PeerID: {}", local_peer_id);
 
     let mut swarm = SwarmBuilder::with_existing_identity(local_key.clone())
@@ -135,7 +129,7 @@ pub async fn build_swarm() -> Result<libp2p::Swarm<VoidBehaviour>> {
             // Discovery (Kademlia + mDNS)
             let kademlia_store = libp2p::kad::store::MemoryStore::new(local_peer_id);
             let mut kademlia = libp2p::kad::Behaviour::new(local_peer_id, kademlia_store);
-            
+
             // Bootnodes (IPFS/Libp2p)
             let bootnodes = [
                 "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -154,16 +148,13 @@ pub async fn build_swarm() -> Result<libp2p::Swarm<VoidBehaviour>> {
                     }
                 }
             }
-            
+
             let mdns = libp2p::mdns::tokio::Behaviour::new(
                 libp2p::mdns::Config::default(),
-                local_peer_id
+                local_peer_id,
             )?;
 
-            let discovery = DiscoveryBehaviour {
-                kademlia,
-                mdns,
-            };
+            let discovery = DiscoveryBehaviour { kademlia, mdns };
 
             // AutoNAT
             let autonat = autonat::Behaviour::new(
@@ -171,19 +162,17 @@ pub async fn build_swarm() -> Result<libp2p::Swarm<VoidBehaviour>> {
                 autonat::Config {
                     only_global_ips: true,
                     ..Default::default()
-                }
+                },
             );
 
             // DCUTR (Direct Connection Upgrade Through Relay)
             let dcutr = dcutr::Behaviour::new(local_peer_id);
 
             // Identify
-            let identify = identify::Behaviour::new(
-                identify::Config::new(
-                    "void/1.0.0".to_string(),
-                    key.public(),
-                )
-            );
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "void/1.0.0".to_string(),
+                key.public(),
+            ));
 
             // Ping
             let ping = ping::Behaviour::new(ping::Config::new());

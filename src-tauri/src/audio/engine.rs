@@ -17,9 +17,7 @@ impl AudioEngine {
 
         println!("Input device: {:?}", device.id());
 
-        let config = device
-            .default_input_config()
-            .map_err(|e| e.to_string())?;
+        let config = device.default_input_config().map_err(|e| e.to_string())?;
 
         let stream = device
             .build_input_stream(
@@ -41,7 +39,7 @@ impl AudioEngine {
 
         stream.play().map_err(|e| e.to_string())?;
         self.stream = Some(stream);
-        
+
         Ok(())
     }
 
