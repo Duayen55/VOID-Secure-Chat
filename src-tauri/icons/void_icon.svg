@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <!-- Neon Glow Filter -->
+    <filter id="neon-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="8" result="blur" />
+      <feColorMatrix in="blur" type="matrix" values="
+        0 0 0 0 0.427
+        0 0 0 0 0.157
+        0 0 0 0 0.851
+        0 0 0 1 0" result="coloredBlur" />
+      <feMerge>
+        <feMergeNode in="coloredBlur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    
+    <!-- Sharp Clip for Hexagon -->
+    <clipPath id="hex-clip">
+      <path d="M256 32 L464 152 L464 360 L256 480 L48 360 L48 152 Z" />
+    </clipPath>
+  </defs>
+
+  <!-- Background: Matte OLED Black -->
+  <rect width="512" height="512" fill="#050505" />
+
+  <!-- Main Container Group -->
+  <g transform="translate(0, 0)">
+    
+    <!-- Outer Hexagon Border (Neon Purple) -->
+    <path d="M256 32 L464 152 L464 360 L256 480 L48 360 L48 152 Z" 
+          fill="none" 
+          stroke="#6D28D9" 
+          stroke-width="12" 
+          filter="url(#neon-glow)"
+          opacity="0.9" />
+
+    <!-- Inner Design: Negative Space V -->
+    <!-- We create two filled geometric shapes (Trapezoids/Polygons) on the sides.
+         The gap between them forms a sharp "V". -->
+         
+    <g filter="url(#neon-glow)" opacity="0.9">
+      <!-- Left Shape -->
+      <path d="M48 152 L256 152 L200 360 L48 360 Z" fill="#6D28D9" opacity="0" /> 
+      <!-- Wait, simple fill isn't "negative space". 
+           Let's do this: A solid purple inverted triangle at the top, with a V cut out. -->
+           
+      <path d="M48 152 L464 152 L256 480 Z" fill="none" stroke="none" /> <!-- Reference Triangle -->
+      
+      <!-- Actual Shapes forming the V -->
+      <!-- Left Wing -->
+      <path d="M60 160 L210 160 L230 220 L120 400 Z" fill="#6D28D9" />
+      <!-- Wait, that's just a random shape. -->
+      
+      <!-- Better Design: Two parallel angled blocks. -->
+      <!-- Left Block -->
+      <path d="M100 100 L220 100 L256 200 L136 400 Z" fill="#6D28D9" /> 
+      <!-- No, let's stick to the prompt: "V shape formed by negative space inside a black hexagon" -->
+      <!-- This implies the Hexagon is the container. -->
+      
+      <!-- Let's fill the hexagon with a pattern/solid, but MASK out a V. -->
+      <mask id="v-cutout">
+        <rect width="512" height="512" fill="white" />
+        <!-- The V Cutout (Black) -->
+        <path d="M150 120 L256 420 L362 120 L420 120 L256 500 L92 120 Z" fill="black" />
+      </mask>
+      
+      <!-- The Fill (Purple Geometric Pattern) -->
+      <!-- We use the hexagon shape itself, filled with purple, but masked. -->
+      <path d="M256 42 L454 157 L454 355 L256 470 L58 355 L58 157 Z" 
+            fill="#6D28D9" 
+            mask="url(#v-cutout)" 
+            opacity="0.8" />
+            
+      <!-- Add some tech/cyberpunk grid lines to the fill to make it look cool -->
+      <path d="M58 157 L454 157" stroke="black" stroke-width="4" mask="url(#v-cutout)" />
+      <path d="M58 256 L454 256" stroke="black" stroke-width="4" mask="url(#v-cutout)" />
+      <path d="M58 355 L454 355" stroke="black" stroke-width="4" mask="url(#v-cutout)" />
+      
+    </g>
+    
+    <!-- Accent: A sharp glowing V outline inside the negative space? 
+         User said "V shape formed by negative space", so maybe no outline. 
+         But "Glowing edges" applies to the icon. -->
+         
+  </g>
+</svg>
