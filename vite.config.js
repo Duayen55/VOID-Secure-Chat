@@ -30,4 +30,25 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+  build: {
+    chunkSizeWarningLimit: 1000, // Increase limit to 1MB
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('firebase')) {
+              return 'firebase';
+            }
+            if (id.includes('@tauri-apps')) {
+              return 'tauri';
+            }
+            if (id.includes('svelte')) {
+              return 'svelte';
+            }
+            return 'vendor';
+          }
+        }
+      }
+    }
+  }
 }));

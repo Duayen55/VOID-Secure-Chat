@@ -3,7 +3,7 @@
   import { auth, db, signInAnonymously, updateProfile, doc, setDoc, getDoc, onSnapshot, collection, addDoc, updateDoc, arrayUnion, deleteField, query, where, deleteDoc } from '$lib/firebase';
   import { onAuthStateChanged } from 'firebase/auth';
   import { user, activeChat, settings } from '$lib/stores';
-  import { playRingtone, stopRingtone } from '$lib/audio';
+  import { playRingtone, stopRingtone, audioEngine, attachStreamToPeer } from '$lib/audio';
   import { replaceVideoTrack } from '$lib/webrtc';
   import Chat from '$lib/components/Chat.svelte';
   import VideoCall from '$lib/components/VideoCall.svelte';
@@ -12,6 +12,7 @@
   import MusicPlayer from '$lib/components/MusicPlayer.svelte';
 
   import DraggablePanel from '$lib/components/DraggablePanel.svelte';
+  import OverlayContent from '$lib/components/OverlayContent.svelte';
 
   // --- State ---
   let showMusicPlayer = false;
@@ -68,12 +69,94 @@
   let globalCallUnsub: (() => void) | null = null;
   let messagesUnsub: (() => void) | null = null;
   let globalMessageUnsub: (() => void) | null = null;
+  let settingsUnsub: (() => void) | null = null;
+  
+  // Overlay Broadcast
+  let broadcastChannel: BroadcastChannel;
+  let cleanupOverlayListener: () => void;
+  let lastBroadcast = 0;
+
+  async function openOverlay() {
+    // @ts-ignore
+    if (window.documentPictureInPicture) {
+      try {
+        // @ts-ignore
+        const pipWindow = await window.documentPictureInPicture.requestWindow({
+          width: 250,
+          height: 120,
+        });
+        
+        // Copy styles (Tailwind)
+        [...document.styleSheets].forEach((styleSheet) => {
+          try {
+            if (styleSheet.href) {
+                const link = document.createElement('link');
+                link.rel = 'stylesheet';
+                link.href = styleSheet.href;
+                pipWindow.document.head.appendChild(link);
+            } else {
+                const style = document.createElement('style');
+                // Accessing cssRules might fail for cross-origin sheets
+                const rules = [...styleSheet.cssRules].map(r => r.cssText).join('');
+                style.textContent = rules;
+                pipWindow.document.head.appendChild(style);
+            }
+          } catch (e) {
+             // Ignore CORS errors for external sheets
+          }
+        });
+        
+        // Mount component
+        new OverlayContent({
+            target: pipWindow.document.body,
+        });
+        
+        return;
+      } catch(e) {
+        console.error("PiP failed, falling back to popup", e);
+      }
+    }
+    
+    // Fallback
+    window.open('/overlay', 'VOID_OVERLAY', 'width=300,height=150,menubar=no,toolbar=no,location=no,status=no,alwaysOnTop=yes');
+  }
 
   onMount(() => {
     settings.load();
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
     requestNotificationPermission();
+
+    // Init Overlay Broadcast
+    broadcastChannel = new BroadcastChannel('void_overlay_sync');
+    cleanupOverlayListener = audioEngine.addLevelListener((db, isGated) => {
+        const now = Date.now();
+        if (now - lastBroadcast > 50) {
+            lastBroadcast = now;
+            const isTalking = !isGated && !audioEngine.isMuted;
+            const activeProfileName = $settings.profiles.find(p => p.id === $settings.activeProfileId)?.name || "Default";
+            
+            broadcastChannel.postMessage({
+                type: 'state',
+                isMuted: audioEngine.isMuted,
+                isPTT: $settings.profiles.find(p => p.id === $settings.activeProfileId)?.isPTTEnabled || false,
+                isTalking,
+                volume: Math.max(0, Math.min(100, (db + 60) * 2)), // Map -60..-10 to 0..100
+                activeProfile: activeProfileName
+            });
+        }
+    });
+
+    // Auto-start Audio Engine if Ducking is enabled (Ensure mic is listening)
+    settingsUnsub = settings.subscribe(s => {
+        if (s.duckingEnabled && !audioEngine.getRawStream()) {
+             const constraints = s.selectedMicId ? { deviceId: { exact: s.selectedMicId } } : true;
+             // Only start if we are in Main view to avoid login screen prompt
+             if (view === 'main') {
+                 audioEngine.setInput(constraints).catch(e => console.warn("Auto-start mic failed", e));
+             }
+        }
+    });
 
     onAuthStateChanged(auth, (u) => {
       if (u) {
@@ -97,6 +180,10 @@
     window.removeEventListener('keyup', handleKeyUp);
     stopRingtone();
     
+    if (broadcastChannel) broadcastChannel.close();
+    if (cleanupOverlayListener) cleanupOverlayListener();
+    if (settingsUnsub) settingsUnsub();
+
     cleanupCall();
     if (signalingUnsub) signalingUnsub();
     if (globalCallUnsub) globalCallUnsub();
@@ -399,18 +486,46 @@
       if (existingStream) {
          localStream = existingStream;
       } else {
-         localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: video });
+         // Use Audio Engine
+         const constraints = {
+            audio: {
+                deviceId: $settings.selectedMicId ? { exact: $settings.selectedMicId } : undefined,
+                noiseSuppression: $settings.noiseSuppression,
+                echoCancellation: $settings.echoCancellation,
+                autoGainControl: $settings.autoGainControl
+            },
+            video: video
+         };
+         
+         // If video is requested, we need to get video separately or combined
+         // AudioEngine only handles Audio.
+         // Strategy: Get Audio via Engine, Get Video via standard, Combine.
+         
+         const processedAudioStream = await audioEngine.setInput(constraints.audio);
+         
+         if (video) {
+             const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+             // Merge
+             localStream = new MediaStream([
+                 ...processedAudioStream.getAudioTracks(),
+                 ...videoStream.getVideoTracks()
+             ]);
+         } else {
+             localStream = processedAudioStream;
+         }
       }
       isScreenSharing = video;
       
       peerConnection = new RTCPeerConnection(servers);
       
       // Add Tracks
-      localStream.getTracks().forEach(track => peerConnection?.addTrack(track, localStream!));
+      if (localStream) {
+        attachStreamToPeer(peerConnection, localStream);
+      }
       
-      // Apply PTT Mute if enabled
+      // Apply PTT Mute if enabled (handled by AudioEngine logic now, but ensure UI state)
       if ($settings.isPTTEnabled) {
-        setMicState(false);
+        audioEngine.setPTTActive(false); // Start muted
       }
       
       // Data Channel
@@ -669,13 +784,8 @@
   // --- In-Call Controls ---
 
   function toggleMute() {
-    if (localStream) {
-      const audioTrack = localStream.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        isMuted = !audioTrack.enabled;
-      }
-    }
+    isMuted = !isMuted;
+    audioEngine.setMute(isMuted);
   }
 
   function toggleDeaf() {
@@ -880,7 +990,7 @@
   function togglePTT() {
       if ($settings.isPTTEnabled) {
           isPTTActive = !isPTTActive;
-          setMicState(isPTTActive);
+          audioEngine.setPTTActive(isPTTActive);
       }
   }
 
@@ -888,6 +998,13 @@
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.repeat) return;
+    
+    // Ignore if typing in an input field
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+        return;
+    }
+
     const key = e.key.toLowerCase();
     
     // Shortcuts
@@ -902,7 +1019,8 @@
       if (key === $settings.shortcuts.end) endCall();
       if (key === $settings.pttKey && $settings.isPTTEnabled) {
          isPTTActive = true;
-         setMicState(true); // Unmute
+         // setMicState(true); // Unmute
+         audioEngine.setPTTActive(true);
       }
     }
   }
@@ -911,7 +1029,8 @@
       const key = e.key.toLowerCase();
       if (callState === 'connected' && key === $settings.pttKey && $settings.isPTTEnabled) {
           isPTTActive = false;
-          setMicState(false); // Mute
+          // setMicState(false); // Mute
+          audioEngine.setPTTActive(false);
       }
   }
 </script>
@@ -945,9 +1064,14 @@
              <span class="text-[10px] text-gray-600 uppercase">Your UID</span>
            </div>
         </div>
-        <button on:click={() => showSettings = true} class="p-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition text-gray-400 hover:text-white" title="Settings">
-           ⚙️
-        </button>
+        <div class="flex space-x-2">
+            <button on:click={openOverlay} class="p-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition text-gray-400 hover:text-white" title="Open Game Overlay">
+                🔲
+            </button>
+            <button on:click={() => showSettings = true} class="p-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition text-gray-400 hover:text-white" title="Settings">
+               ⚙️
+            </button>
+        </div>
       </div>
 
       <h3 class="text-gray-500 uppercase text-xs font-bold mb-3 tracking-wider">Friends</h3>
@@ -1007,6 +1131,8 @@
 
   <!-- SETTINGS MODAL -->
   <Settings bind:show={showSettings} />
+
+
 
   <!-- INCOMING CALL MODAL -->
   {#if incomingCall}

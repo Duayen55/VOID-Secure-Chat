@@ -214,15 +214,22 @@
       </div>
 
       <!-- Volume & Vis -->
-      <div class="hidden md:flex flex-col space-y-2 w-24">
-          <div class="flex items-end space-x-1 h-8 justify-center">
+      <div class="flex flex-col space-y-2 w-32 bg-gray-800/80 p-2 rounded-lg backdrop-blur-sm">
+          <div class="flex items-center justify-between text-[10px] text-gray-400 font-mono">
+              <span>USER VOL</span>
+              <span>{Math.round(remoteVolume * 100)}%</span>
+          </div>
+          
+          <!-- Visualizer -->
+          <div class="flex items-end space-x-[2px] h-10 justify-center bg-gray-900/50 rounded p-1">
              {#each audioLevels as level}
                 <div 
-                   class="w-1.5 bg-green-400 rounded-full transition-all duration-75"
-                   style="height: {Math.max(20, level * 100)}%"
+                   class="flex-1 bg-green-500 rounded-[1px] transition-all duration-75 shadow-[0_0_5px_rgba(34,197,94,0.5)]"
+                   style="height: {Math.max(5, level * 100)}%; opacity: {0.3 + (level * 0.7)}"
                 ></div>
              {/each}
           </div>
+          
           <input 
             type="range" min="0" max="1" step="0.01" 
             bind:value={remoteVolume}
