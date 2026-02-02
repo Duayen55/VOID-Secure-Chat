@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "void",
+  "productName": "VOID",
   "version": "0.1.1",
-  "identifier": "com.lenovo.void",
+  "identifier": "com.void.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -18,7 +18,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: wss: data: blob:;"
     }
   },
   "bundle": {

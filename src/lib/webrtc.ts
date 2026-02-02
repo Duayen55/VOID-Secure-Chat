@@ -12,12 +12,10 @@ let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 
 // --- EKRAN PAYLAŞIMI BAŞLATMA (GÖNDEREN) ---
-export async function startScreenShare(targetPeerId: string) {
+export async function startScreenShare(targetPeerId: string, constraints?: MediaStreamConstraints) {
     console.log("Starting Screen Share to", targetPeerId);
     try {
-        // TypeScript hatasını düzeltmek için 'as any' kullanıyoruz
-        // Çünkü standart tip tanımlarında 'cursor' özelliği bazen eksik olabiliyor.
-        const displayMediaOptions = {
+        const displayMediaOptions = constraints || {
             video: { cursor: "always" } as any, 
             audio: false
         };
@@ -167,5 +165,68 @@ async function sendSignal(peerId: string, data: SignalData) {
         });
     } catch (e) {
         console.error("Signal Send Error:", e);
+    }
+}
+
+// --- ADVANCED CONTROLS (NEW) ---
+
+export async function updateVideoQuality(bitrate: number, resolution: '720p' | '1080p' | '4k', pcInstance?: RTCPeerConnection | null) {
+    const targetPc = pcInstance || pc;
+    if (!targetPc) return;
+    const senders = targetPc.getSenders();
+    const videoSender = senders.find(s => s.track?.kind === 'video');
+    
+    if (videoSender) {
+        const parameters = videoSender.getParameters();
+        if (!parameters.encodings) parameters.encodings = [{}];
+        
+        // Bitrate Control
+        parameters.encodings[0].maxBitrate = bitrate;
+        
+        // Resolution Scaling (Simple heuristic)
+        // 1.0 = original, 2.0 = half width/height
+        let scale = 1.0;
+        if (resolution === '720p') scale = 2.0;       // Aggressive downscale for performance
+        else if (resolution === '1080p') scale = 1.0; // Native (assuming typical screen)
+        else if (resolution === '4k') scale = 1.0;    // Native
+        
+        // If the source is actually 4k, 1080p setting might want scale=2.0, but we'll stick to simple logic
+        // or checking track settings. For now, simplistic mapping:
+        parameters.encodings[0].scaleResolutionDownBy = scale;
+
+        try {
+            await videoSender.setParameters(parameters);
+            console.log(`Video quality updated: ${bitrate} bps, Scale: ${scale}`);
+        } catch (e) {
+            console.error("Failed to set video quality:", e);
+        }
+    }
+}
+
+export async function replaceVideoTrack(newTrack: MediaStreamTrack, pcInstance?: RTCPeerConnection | null, stream?: MediaStream) {
+    const targetPc = pcInstance || pc;
+    const targetStream = stream || localStream;
+
+    if (!targetPc) return;
+    const senders = targetPc.getSenders();
+    const videoSender = senders.find(s => s.track?.kind === 'video');
+    
+    if (videoSender) {
+        try {
+            await videoSender.replaceTrack(newTrack);
+            console.log("Video track replaced successfully");
+        } catch (e) {
+            console.error("Failed to replace video track:", e);
+        }
+    } else {
+        // If no video sender exists, add the track
+        // Note: This might require renegotiation
+        if (targetStream) {
+             targetPc.addTrack(newTrack, targetStream);
+        } else {
+             console.warn("No MediaStream provided to addTrack");
+             // Fallback: Add track without stream (streamless track)
+             targetPc.addTrack(newTrack);
+        }
     }
 }

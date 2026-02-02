@@ -1,4 +1,3 @@
-pub mod discovery;
 pub mod swarm;
 pub mod utils;
 
@@ -65,6 +64,31 @@ pub async fn start_node(state: State<'_, NetworkState>, app: AppHandle) -> Resul
             Ok(mut swarm) => {
                 println!("Swarm initialized successfully");
 
+                // Bootnodes (Relays)
+                let bootnodes = [
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTeq5s0GNHw5zXIov6U",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9CkJv68846kJcCPaQFjNA",
+                    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1Ubuu79rfVP3",
+                ];
+
+                for peer in bootnodes {
+                    if let Ok(addr) = peer.parse::<Multiaddr>() {
+                        println!("Dialing bootnode: {}", addr);
+                        if let Err(e) = swarm.dial(addr) {
+                            println!("Failed to dial bootnode: {}", e);
+                        }
+                    }
+                }
+
+                // Listen on p2p-circuit (Relay)
+                if let Ok(addr) = "/p2p-circuit".parse::<Multiaddr>() {
+                     println!("Attempting to listen on relay...");
+                     if let Err(e) = swarm.listen_on(addr) {
+                         println!("Failed to listen on relay: {}", e);
+                     }
+                }
+
                 // Main Event Loop
                 loop {
                     tokio::select! {
@@ -85,7 +109,6 @@ pub async fn start_node(state: State<'_, NetworkState>, app: AppHandle) -> Resul
                                 }
                                 NetworkCommand::GetIdentity(reply_tx) => {
                                     let peer_id = *swarm.local_peer_id();
-                                    // Collect external addresses first, then listeners
                                     let mut addrs: Vec<Multiaddr> = swarm.external_addresses().map(|a| a.clone()).collect();
                                     if addrs.is_empty() {
                                         addrs = swarm.listeners().map(|a| a.clone()).collect();
@@ -105,21 +128,11 @@ pub async fn start_node(state: State<'_, NetworkState>, app: AppHandle) -> Resul
                                     println!("Listening on {:?}", address);
                                     let _ = app.emit("network-event", format!("Listening on {:?}", address));
                                 }
-                                SwarmEvent::Behaviour(VoidEvent::Discovery(discovery::DiscoveryEvent::Mdns(event))) => {
-                                    println!("MDNS Event: {:?}", event);
+                                SwarmEvent::Behaviour(VoidEvent::RelayClient(event)) => {
+                                     println!("Relay Event: {:?}", event);
                                 }
-                                SwarmEvent::Behaviour(VoidEvent::Discovery(discovery::DiscoveryEvent::Kademlia(_event))) => {
-                                    // Reduce log spam for Kademlia
-                                    // println!("Kademlia Event: {:?}", event);
-                                }
-                                SwarmEvent::Behaviour(VoidEvent::Autonat(event)) => {
-                                    println!("AutoNAT Event: {:?}", event);
-                                    // If we confirmed our public address, emit it
-                                    if let libp2p::autonat::Event::StatusChanged { new, .. } = event {
-                                        if let libp2p::autonat::NatStatus::Public(addr) = new {
-                                            let _ = app.emit("network-event", format!("Public Address Confirmed: {:?}", addr));
-                                        }
-                                    }
+                                SwarmEvent::Behaviour(VoidEvent::Identify(event)) => {
+                                     println!("Identify Event: {:?}", event);
                                 }
                                 SwarmEvent::Behaviour(VoidEvent::Signaling(event)) => {
                                     match event {
@@ -197,44 +210,19 @@ pub async fn get_my_void_code(state: State<'_, NetworkState>) -> Result<String, 
 
         let (peer_id, addrs) = rx.await.map_err(|e| e.to_string())?;
 
-        // Find a suitable IP and Port
-        // Logic: Look for non-local IP if possible.
-        // If listeners are 0.0.0.0, we can't really use that for the code unless we resolve local IP.
-        // But for now, let's try to find a valid IP.
-
-        let mut best_ip = "127.0.0.1".to_string();
-        let mut best_port = 0;
-
-        for addr in addrs {
-            let mut ip = None;
-            let mut port = None;
-
-            for protocol in addr.iter() {
-                match protocol {
-                    libp2p::multiaddr::Protocol::Ip4(i) => {
-                        if !i.is_loopback() && !i.is_unspecified() {
-                            ip = Some(i.to_string());
-                        } else if i.is_loopback() {
-                            // keep loopback if nothing else
-                        }
-                    }
-                    libp2p::multiaddr::Protocol::Udp(p) => port = Some(p),
-                    libp2p::multiaddr::Protocol::Tcp(p) => port = Some(p),
-                    _ => {}
-                }
-            }
-
-            if let (Some(i), Some(p)) = (ip, port) {
-                best_ip = i;
-                best_port = p;
-                // If it's not local, break, we found a good one
-                if best_ip != "127.0.0.1" {
-                    break;
-                }
-            }
+        // Prioritize relay address (p2p-circuit)
+        for addr in &addrs {
+             if addr.to_string().contains("p2p-circuit") {
+                 return Ok(utils::generate_void_code(addr));
+             }
         }
 
-        Ok(utils::generate_void_code(peer_id, &best_ip, best_port))
+        // Fallback to first available address
+        if let Some(addr) = addrs.first() {
+            return Ok(utils::generate_void_code(addr));
+        }
+
+        Err("No listen address found yet".into())
     } else {
         Err("Node not running".into())
     }
