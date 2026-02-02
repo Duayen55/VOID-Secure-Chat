@@ -15,6 +15,48 @@
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') close();
   }
+
+  // Export/Import Logic
+  let importError = "";
+
+  function exportSettings() {
+      const data = JSON.stringify($settings, null, 2);
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `void_preset_${new Date().toISOString().slice(0,10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+  }
+
+  async function importSettings(e: Event) {
+      importError = "";
+      const input = e.target as HTMLInputElement;
+      if (!input.files || input.files.length === 0) return;
+      
+      const file = input.files[0];
+      try {
+          const text = await file.text();
+          const data = JSON.parse(text);
+          
+          // Basic Validation
+          if (typeof data.micGain !== 'number' || !Array.isArray(data.profiles)) {
+              throw new Error("Invalid preset format");
+          }
+          
+          // Apply
+          settings.set({ ...$settings, ...data });
+          settings.save(data);
+          alert("Preset imported successfully!");
+      } catch (err) {
+          console.error(err);
+          importError = "Failed to import: Invalid JSON or incompatible version.";
+      }
+      input.value = ""; // Reset
+  }
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
@@ -146,6 +188,27 @@
       <!-- Footer -->
       <div class="p-4 bg-[#0F1115] border-t border-gray-700 text-center shrink-0">
         <span class="text-[10px] text-gray-600">VOID COMMUNICATIONS PROTOCOL v2.0</span>
+        <div class="h-px bg-gray-700/50 w-full"></div>
+
+        <!-- Configuration Presets -->
+        <section class="space-y-4 pb-4">
+            <h4 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Configuration Presets</h4>
+            <div class="grid grid-cols-2 gap-4">
+                <button 
+                    class="p-4 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded-xl flex items-center justify-center gap-2 transition text-gray-200"
+                    on:click={exportSettings}
+                >
+                    <span>📤</span> Export Settings
+                </button>
+                <label class="p-4 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded-xl flex items-center justify-center gap-2 transition cursor-pointer text-gray-200">
+                    <span>📥</span> Import Settings
+                    <input type="file" accept=".json" class="hidden" on:change={importSettings}>
+                </label>
+            </div>
+            {#if importError}
+                <div class="text-red-400 text-sm bg-red-900/20 p-2 rounded text-center border border-red-500/30">{importError}</div>
+            {/if}
+        </section>
       </div>
     </div>
   </div>

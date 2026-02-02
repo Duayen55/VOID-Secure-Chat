@@ -1,8 +1,11 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { slide } from 'svelte/transition';
+  import { tweened } from 'svelte/motion';
+  import { cubicOut } from 'svelte/easing';
   import { db, doc, updateDoc, onSnapshot, serverTimestamp } from '$lib/firebase';
-  import { user } from '$lib/stores';
+  import { user, settings } from '$lib/stores';
+  import { audioEngine } from '$lib/audio';
 
   const dispatch = createEventDispatcher();
 
@@ -52,6 +55,11 @@
   let syncLatencyThreshold = 3; // seconds
   let isRemoteUpdate = false; // Prevent echo loops
   let ytTimer: any = null; // Fake timer for YouTube
+  
+  // --- Ducking State ---
+  let duckingFactor = tweened(1.0, { duration: 300, easing: cubicOut });
+  let releaseTimer: any = null;
+  let cleanupSpeaking: (() => void) | null = null;
 
   // --- Persistence ---
   const STORAGE_KEY = 'void_music_player_settings';
@@ -76,9 +84,44 @@
     window.addEventListener('mouseup', stopDrag);
     window.addEventListener('mousemove', handleDrag);
     window.addEventListener('message', handleYTEvents);
+    
+    // Ducking Listener
+    cleanupSpeaking = audioEngine.addSpeakingListener((speaking) => {
+        if (!$settings.duckingEnabled) {
+            duckingFactor.set(1);
+            return;
+        }
+
+        if (speaking) {
+            clearTimeout(releaseTimer);
+            duckingFactor.set(1 - $settings.duckingAmount, { duration: 100 });
+        } else {
+            clearTimeout(releaseTimer);
+            releaseTimer = setTimeout(() => {
+                duckingFactor.set(1, { duration: 500 });
+            }, $settings.duckingRelease);
+        }
+    });
   });
 
-  // Watch volume to persist
+  // Apply Volume (Master * Ducking)
+  $: effectiveVolume = volume * $duckingFactor;
+  
+  // Watch volume changes to update audio elements
+  $: if (audio) {
+      audio.volume = Math.max(0, Math.min(1, effectiveVolume));
+  }
+  
+  // Update YouTube volume if active
+  $: if (playlist[currentTrackIndex]?.isYouTube && effectiveVolume !== undefined) {
+      // Debounce slightly or just send? PostMessage is cheap.
+      // But we need to ensure player is ready.
+      // We'll rely on the interval or just send it.
+      const vol = Math.max(0, Math.min(100, effectiveVolume * 100));
+      sendYT('setVolume', vol);
+  }
+
+  // Watch volume to persist (Raw volume only)
   $: if (typeof localStorage !== 'undefined') {
       const settings = { volume, isShuffle, isLoop, quality };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
@@ -90,6 +133,8 @@
     window.removeEventListener('mousemove', handleDrag);
     window.removeEventListener('message', handleYTEvents);
     if (syncUnsub) syncUnsub();
+    if (cleanupSpeaking) cleanupSpeaking();
+    if (releaseTimer) clearTimeout(releaseTimer);
   });
 
   // Handle YouTube PostMessage Events (Duration, etc.)

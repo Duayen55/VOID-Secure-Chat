@@ -1,5 +1,13 @@
 import { writable } from 'svelte/store';
 
+export interface GameProfile {
+  id: string;
+  name: string;
+  isPTTEnabled: boolean;
+  noiseGateThreshold: number;
+  micGain: number;
+}
+
 export interface Settings {
   isPTTEnabled: boolean;
   pttKey: string;
@@ -21,6 +29,15 @@ export interface Settings {
   echoCancellation: boolean;
   autoGainControl: boolean;
   noiseGateThreshold: number;
+  micGain: number;
+  
+  // Phase 2: Profiles & Ducking
+  profiles: GameProfile[];
+  activeProfileId: string | null;
+  
+  duckingEnabled: boolean;
+  duckingAmount: number; // 0.0 to 1.0 (reduction factor)
+  duckingRelease: number; // ms
 }
 
 const defaultSettings: Settings = {
@@ -41,7 +58,15 @@ const defaultSettings: Settings = {
   noiseSuppression: true,
   echoCancellation: true,
   autoGainControl: true,
-  noiseGateThreshold: -50
+  noiseGateThreshold: -50,
+  micGain: 1.0,
+  
+  profiles: [],
+  activeProfileId: null,
+  
+  duckingEnabled: false,
+  duckingAmount: 0.3, // Reduce to 30%
+  duckingRelease: 1000
 };
 
 function createSettingsStore() {

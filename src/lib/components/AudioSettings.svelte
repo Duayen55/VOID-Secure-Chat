@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { settings } from '$lib/stores';
+  import { audioEngine } from '$lib/audio';
 
   export let show = true;
 
@@ -10,14 +11,6 @@
   // --- State ---
   let microphones: MediaDeviceInfo[] = [];
   let speakers: MediaDeviceInfo[] = [];
-  
-  // Audio Processing State
-  let audioContext: AudioContext | null = null;
-  let sourceNode: MediaStreamAudioSourceNode | null = null;
-  let gainNode: GainNode | null = null; // Used for Noise Gate
-  let analyser: AnalyserNode | null = null;
-  let stream: MediaStream | null = null;
-  let animationFrame: number;
   
   // Noise Gate Runtime State
   let currentLevel = -100; // dB
@@ -30,24 +23,104 @@
   // Visualizer
   let canvas: HTMLCanvasElement;
   let canvasCtx: CanvasRenderingContext2D | null = null;
+  
+  // Key listening for PTT bind
+  let isListeningForKey = false;
+  
+  // Profile Management
+  let newProfileName = "";
+  
+  let cleanupLevelListener: () => void;
 
   onMount(async () => {
     await getDevices();
     navigator.mediaDevices.addEventListener('devicechange', getDevices);
     
-    // Initialize Audio Context (user interaction usually required, but here we assume context of settings panel)
-    // We'll start processing when a mic is selected or immediately if permission exists
-    startAudioProcessing();
+    // Use AudioEngine
+    cleanupLevelListener = audioEngine.addLevelListener((db, gated) => {
+        currentLevel = db;
+        isGated = gated;
+        drawVisualizer(db);
+    });
+    
+    // Apply initial settings including gain
+    audioEngine.updateSettings($settings);
+    restartEngine();
   });
 
+  // ... (rest of lifecycle)
+
+  // Profile Logic
+  function createProfile() {
+      if (!newProfileName.trim()) return;
+      const newProfile = {
+          id: crypto.randomUUID(),
+          name: newProfileName,
+          isPTTEnabled: $settings.isPTTEnabled,
+          noiseGateThreshold: $settings.noiseGateThreshold,
+          micGain: $settings.micGain || 1.0
+      };
+      $settings.profiles = [...$settings.profiles, newProfile];
+      $settings.activeProfileId = newProfile.id;
+      newProfileName = "";
+  }
+
+  function deleteProfile() {
+      if (!$settings.activeProfileId) return;
+      $settings.profiles = $settings.profiles.filter(p => p.id !== $settings.activeProfileId);
+      $settings.activeProfileId = null;
+  }
+
+  function loadProfile() {
+      if (!$settings.activeProfileId) return;
+      const profile = $settings.profiles.find(p => p.id === $settings.activeProfileId);
+      if (profile) {
+          $settings.isPTTEnabled = profile.isPTTEnabled;
+          $settings.noiseGateThreshold = profile.noiseGateThreshold;
+          $settings.micGain = profile.micGain;
+          audioEngine.updateSettings($settings);
+      }
+  }
+
+  // Auto-save changes to active profile
+  $: if ($settings.activeProfileId && ($settings.isPTTEnabled !== undefined || $settings.noiseGateThreshold !== undefined || $settings.micGain !== undefined)) {
+      const idx = $settings.profiles.findIndex(p => p.id === $settings.activeProfileId);
+      if (idx !== -1) {
+          const p = $settings.profiles[idx];
+          // Check if changed to avoid loops? Svelte store update might trigger loop if not careful.
+          // But here we are mutating the array inside the store.
+          // We only want to update if values differ.
+          if (p.isPTTEnabled !== $settings.isPTTEnabled || 
+              p.noiseGateThreshold !== $settings.noiseGateThreshold || 
+              p.micGain !== $settings.micGain) {
+                  
+              const updated = { ...p, 
+                  isPTTEnabled: $settings.isPTTEnabled, 
+                  noiseGateThreshold: $settings.noiseGateThreshold, 
+                  micGain: $settings.micGain 
+              };
+              const newProfiles = [...$settings.profiles];
+              newProfiles[idx] = updated;
+              $settings.profiles = newProfiles;
+          }
+      }
+  }
+  
+  // Sync AudioEngine when settings change (including Gain/Ducking)
+  $: {
+      audioEngine.updateSettings($settings);
+  }
+
   onDestroy(() => {
-    stopAudioProcessing();
+    if (cleanupLevelListener) cleanupLevelListener();
     navigator.mediaDevices.removeEventListener('devicechange', getDevices);
   });
 
   async function getDevices() {
     try {
       // Request permission first to get labels
+      // Note: This might interfere with running AudioEngine if not careful, 
+      // but usually okay to request transient stream
       const permStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       permStream.getTracks().forEach(t => t.stop());
 
@@ -67,12 +140,8 @@
     }
   }
 
-  async function startAudioProcessing() {
-    stopAudioProcessing(); // Cleanup previous
-
-    if (!$settings.selectedMicId) return;
-
-    try {
+  async function restartEngine() {
+      if (!$settings.selectedMicId) return;
       const constraints = {
         audio: {
           deviceId: { exact: $settings.selectedMicId },
@@ -81,145 +150,86 @@
           autoGainControl: $settings.autoGainControl
         }
       };
-
-      stream = await navigator.mediaDevices.getUserMedia(constraints);
-      
-      // Notify parent/external integration
-      dispatch('stream', stream);
-
-      // Web Audio API Setup
-      audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      sourceNode = audioContext.createMediaStreamSource(stream);
-      analyser = audioContext.createAnalyser();
-      gainNode = audioContext.createGain();
-      
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.3;
-
-      // Connect Chain: Source -> Analyser -> Gain (Gate) -> Destination (if monitoring)
-      sourceNode.connect(analyser);
-      analyser.connect(gainNode);
-      
-      // For monitoring/speaker selection, we use a MediaStreamDestination or Audio Element
-      // Since we need setSinkId, we must use HTMLAudioElement
-      if (audioOutputElement) {
-        const dest = audioContext.createMediaStreamDestination();
-        gainNode.connect(dest);
-        audioOutputElement.srcObject = dest.stream;
-        
-        // Apply Speaker Selection
-        if ('setSinkId' in audioOutputElement && $settings.selectedSpeakerId) {
-          // @ts-ignore
-          audioOutputElement.setSinkId($settings.selectedSpeakerId).catch(e => console.warn("setSinkId failed", e));
-        }
-      }
-
-      drawVisualizer();
-
-    } catch (err) {
-      console.error("Error starting audio processing:", err);
-    }
+      await audioEngine.setInput(constraints.audio);
   }
 
-  function stopAudioProcessing() {
-    if (stream) stream.getTracks().forEach(t => t.stop());
-    if (audioContext) audioContext.close();
-    if (animationFrame) cancelAnimationFrame(animationFrame);
-    stream = null;
-    audioContext = null;
-    sourceNode = null;
-    gainNode = null;
-    analyser = null;
+  // Watch for setting changes that require restart
+  $: if ($settings.selectedMicId || $settings.noiseSuppression || $settings.echoCancellation || $settings.autoGainControl) {
+      // Debounce or just call? For now direct call.
+      // But only if we are "active" (e.g. in this view or call). 
+      // Actually, if we change mic in settings, we WANT it to change globally.
+      restartEngine();
+  }
+  
+  // PTT Key Bind
+  function startKeyListen() {
+      isListeningForKey = true;
+      window.addEventListener('keydown', handleKeyBind);
+  }
+  
+  function handleKeyBind(e: KeyboardEvent) {
+      e.preventDefault();
+      $settings.pttKey = e.key;
+      isListeningForKey = false;
+      window.removeEventListener('keydown', handleKeyBind);
   }
 
-  function updateGate() {
-    if (!analyser || !gainNode) return;
+  function drawVisualizer(db: number) {
+     if (!canvas) return;
+     if (!canvasCtx) canvasCtx = canvas.getContext('2d');
+     if (!canvasCtx) return;
 
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    analyser.getByteTimeDomainData(dataArray);
+     const width = canvas.width;
+     const height = canvas.height;
+     
+     canvasCtx.clearRect(0, 0, width, height);
+     
+     // DB range: -60 to 0 (approx)
+     // Normalize to 0-1
+     let t = (db + 60) / 60; 
+     if (t < 0) t = 0;
+     if (t > 1) t = 1;
+     
+     const barWidth = width * t;
+     
+     canvasCtx.fillStyle = isGated ? '#ef4444' : '#22c55e'; // Red if gated, Green if open
+     canvasCtx.fillRect(0, 0, barWidth, height);
+     
+     // Draw Threshold Line
+     const threshT = ($settings.noiseGateThreshold + 60) / 60;
+     const threshX = width * threshT;
+     
+     canvasCtx.fillStyle = '#ffffff';
+     canvasCtx.fillRect(threshX, 0, 2, height);
 
-    // Calculate RMS
-    let sum = 0;
-    for(let i = 0; i < bufferLength; i++) {
-        const x = (dataArray[i] - 128) / 128.0;
-        sum += x * x;
-    }
-    const rms = Math.sqrt(sum / bufferLength);
-    
-    // Convert to dB
-    const db = 20 * Math.log10(rms + 0.00001); // Prevent -Infinity
-    currentLevel = db;
-
-    // Gate Logic
-    if (db < $settings.noiseGateThreshold) {
-        // Close Gate (Mute)
-        // Smooth transition
-        gainNode.gain.setTargetAtTime(0, audioContext!.currentTime, 0.1);
-        isGated = true;
-      } else {
-        // Open Gate (Unmute)
-        gainNode.gain.setTargetAtTime(1, audioContext!.currentTime, 0.05);
-        isGated = false;
-      }
-  }
-
-  function drawVisualizer() {
-    if (!canvas) return;
-    if (!canvasCtx) canvasCtx = canvas.getContext('2d');
-    if (!canvasCtx) return;
-
-    updateGate(); // Run gate logic in loop
-
-    const width = canvas.width;
-    const height = canvas.height;
-
-    canvasCtx.fillStyle = '#111827'; // Dark BG
-    canvasCtx.fillRect(0, 0, width, height);
-
-    // Draw Threshold Line
-    // Map -100dB to 0dB range to canvas width
-    // Range: -100 to 0
-    const normalizeDB = (db: number) => Math.min(Math.max((db + 100) / 100, 0), 1);
-    
-    const thresholdX = normalizeDB($settings.noiseGateThreshold) * width;
-    const currentX = normalizeDB(currentLevel) * width;
-
-    // Draw Level Bar
-    canvasCtx.fillStyle = isGated ? '#EF4444' : '#10B981'; // Red if gated, Green if open
-    canvasCtx.fillRect(0, 0, currentX, height);
-
-    // Draw Threshold Marker
-    canvasCtx.beginPath();
-    canvasCtx.moveTo(thresholdX, 0);
-    canvasCtx.lineTo(thresholdX, height);
-    canvasCtx.strokeStyle = '#FCD34D'; // Yellow
-    canvasCtx.lineWidth = 2;
-    canvasCtx.stroke();
-    
-    // Text Info
-    canvasCtx.fillStyle = '#fff';
-    canvasCtx.font = '10px sans-serif';
-    canvasCtx.fillText(`Level: ${currentLevel.toFixed(1)} dB`, 5, 12);
-    canvasCtx.fillText(`Gate: ${$settings.noiseGateThreshold} dB`, thresholdX + 5, 12);
-
-    animationFrame = requestAnimationFrame(drawVisualizer);
+     // Text Info
+     canvasCtx.fillStyle = '#fff';
+     canvasCtx.font = '10px sans-serif';
+     canvasCtx.fillText(`Level: ${currentLevel.toFixed(1)} dB`, 5, 12);
+     canvasCtx.fillText(`Gate: ${$settings.noiseGateThreshold} dB`, threshX + 5, 12);
   }
 
   // Handle changes
   function handleConstraintChange() {
     // Restart to apply constraints reliably
-    startAudioProcessing();
+    restartEngine();
   }
   
   function handleDeviceChange() {
-      startAudioProcessing();
+      restartEngine();
   }
 
-  $: if (monitorAudio && audioOutputElement) {
-      audioOutputElement.play().catch(() => {});
-  } else if (audioOutputElement) {
-      audioOutputElement.pause();
+  $: if (audioOutputElement) {
+      if (monitorAudio) {
+          const stream = audioEngine.getProcessedStream();
+          if (audioOutputElement.srcObject !== stream) {
+              audioOutputElement.srcObject = stream;
+          }
+          audioOutputElement.play().catch(() => {});
+      } else {
+          audioOutputElement.pause();
+          audioOutputElement.srcObject = null;
+      }
   }
 
   $: if ($settings.selectedSpeakerId && audioOutputElement && 'setSinkId' in audioOutputElement) {
@@ -238,6 +248,54 @@
     </div>
 
     <div class="space-y-6">
+        <!-- Game Profiles -->
+        <div class="bg-blue-900/20 rounded-lg p-4 border border-blue-500/30">
+            <div class="flex justify-between items-center mb-3">
+                <label class="block text-xs font-semibold uppercase tracking-wider text-blue-400">Game Profile</label>
+                {#if $settings.activeProfileId}
+                    <span class="text-xs text-green-400 font-mono">ACTIVE</span>
+                {/if}
+            </div>
+            
+            <div class="flex gap-2 mb-3">
+                <select 
+                    bind:value={$settings.activeProfileId} 
+                    on:change={loadProfile}
+                    class="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none text-white"
+                >
+                    <option value={null}>Default / Custom</option>
+                    {#each $settings.profiles as profile}
+                        <option value={profile.id}>{profile.name}</option>
+                    {/each}
+                </select>
+                {#if $settings.activeProfileId}
+                    <button 
+                        on:click={deleteProfile}
+                        class="px-3 py-2 bg-red-900/50 hover:bg-red-900/80 text-red-200 rounded-lg border border-red-800 transition-colors text-sm"
+                    >
+                        Delete
+                    </button>
+                {/if}
+            </div>
+
+            <div class="flex gap-2">
+                <input 
+                    type="text" 
+                    bind:value={newProfileName} 
+                    placeholder="New Profile Name..." 
+                    class="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none text-white placeholder-gray-500"
+                    on:keydown={(e) => e.key === 'Enter' && createProfile()}
+                />
+                <button 
+                    on:click={createProfile}
+                    disabled={!newProfileName.trim()}
+                    class="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm"
+                >
+                    Create
+                </button>
+            </div>
+        </div>
+
         <!-- Device Selection -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <!-- Microphone -->
@@ -268,6 +326,37 @@
             </div>
         </div>
 
+        <!-- Input Mode -->
+        <div class="bg-gray-800/50 rounded-lg p-4 space-y-4 border border-gray-700/50">
+            <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Input Mode</label>
+            
+            <div class="flex flex-col space-y-3">
+                <div class="flex items-center gap-4">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="radio" name="inputMode" checked={!$settings.isPTTEnabled} on:change={() => $settings.isPTTEnabled = false} class="text-blue-500 bg-gray-700 border-gray-600 focus:ring-blue-500/50">
+                        <span class="text-sm">Voice Activity</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="radio" name="inputMode" checked={$settings.isPTTEnabled} on:change={() => $settings.isPTTEnabled = true} class="text-blue-500 bg-gray-700 border-gray-600 focus:ring-blue-500/50">
+                        <span class="text-sm">Push to Talk</span>
+                    </label>
+                </div>
+
+                {#if $settings.isPTTEnabled}
+                    <div class="flex items-center gap-4 bg-gray-900/50 p-3 rounded-lg border border-gray-700">
+                        <span class="text-sm text-gray-300">Shortcut:</span>
+                        <button 
+                            on:click={startKeyListen}
+                            class="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm font-mono border border-gray-600 transition-colors min-w-[100px] text-center"
+                            class:animate-pulse={isListeningForKey}
+                        >
+                            {isListeningForKey ? 'Press Key...' : ($settings.pttKey || 'None')}
+                        </button>
+                    </div>
+                {/if}
+            </div>
+        </div>
+
         <!-- Processing Features -->
         <div class="bg-gray-800/50 rounded-lg p-4 space-y-3 border border-gray-700/50">
             <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Enhancements</label>
@@ -287,24 +376,75 @@
             </div>
         </div>
 
-        <!-- Noise Gate -->
-        <div class="space-y-2">
-            <div class="flex justify-between items-center">
-                <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400">Noise Gate Threshold</label>
-                <span class="text-xs font-mono text-blue-400">{$settings.noiseGateThreshold} dB</span>
+        <!-- Noise Gate & Gain -->
+        <div class="space-y-6">
+            <!-- Mic Gain -->
+            <div class="space-y-2">
+                <div class="flex justify-between items-center">
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400">Microphone Gain</label>
+                    <span class="text-xs font-mono text-blue-400">{Math.round(($settings.micGain || 1.0) * 100)}%</span>
+                </div>
+                <input 
+                    type="range" 
+                    min="0" max="5" step="0.1" 
+                    bind:value={$settings.micGain}
+                    class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                >
+            </div>
+
+            <!-- Noise Gate -->
+            <div class="space-y-2">
+                <div class="flex justify-between items-center">
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400">Noise Gate Threshold</label>
+                    <span class="text-xs font-mono text-blue-400">{$settings.noiseGateThreshold} dB</span>
+                </div>
+                
+                <div class="relative h-24 bg-black rounded-lg overflow-hidden border border-gray-700 shadow-inner">
+                    <canvas bind:this={canvas} width="600" height="100" class="w-full h-full block"></canvas>
+                </div>
+                
+                <input 
+                    type="range" 
+                    min="-100" max="0" step="1" 
+                    bind:value={$settings.noiseGateThreshold}
+                    class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500 mt-2"
+                >
+                <p class="text-xs text-gray-500">Audio below this level will be silenced.</p>
+            </div>
+        </div>
+
+        <!-- Ducking (Smart Audio Reduction) -->
+        <div class="bg-gray-800/50 rounded-lg p-4 space-y-4 border border-gray-700/50">
+            <div class="flex items-center justify-between">
+                <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400">Smart Ducking</label>
+                <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" bind:checked={$settings.duckingEnabled} class="sr-only peer">
+                    <div class="w-9 h-5 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600"></div>
+                </label>
             </div>
             
-            <div class="relative h-24 bg-black rounded-lg overflow-hidden border border-gray-700 shadow-inner">
-                <canvas bind:this={canvas} width="600" height="100" class="w-full h-full block"></canvas>
-            </div>
-            
-            <input 
-                type="range" 
-                min="-100" max="0" step="1" 
-                bind:value={$settings.noiseGateThreshold}
-                class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500 mt-2"
-            >
-            <p class="text-xs text-gray-500">Audio below this level will be silenced.</p>
+            {#if $settings.duckingEnabled}
+                <div class="space-y-4 pt-2">
+                     <!-- Amount -->
+                     <div class="space-y-1">
+                        <div class="flex justify-between text-xs text-gray-400">
+                            <span>Reduction Amount</span>
+                            <span>{Math.round((1 - $settings.duckingAmount) * 100)}%</span>
+                        </div>
+                        <input type="range" min="0" max="1" step="0.05" bind:value={$settings.duckingAmount} class="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-purple-500">
+                     </div>
+                     
+                     <!-- Release -->
+                     <div class="space-y-1">
+                        <div class="flex justify-between text-xs text-gray-400">
+                            <span>Release Time</span>
+                            <span>{$settings.duckingRelease}ms</span>
+                        </div>
+                        <input type="range" min="100" max="3000" step="100" bind:value={$settings.duckingRelease} class="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-purple-500">
+                     </div>
+                     <p class="text-xs text-gray-500">Lowers music volume when you speak.</p>
+                </div>
+            {/if}
         </div>
 
         <!-- Monitoring -->
