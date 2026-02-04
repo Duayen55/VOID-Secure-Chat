@@ -49,14 +49,19 @@
             let contentLength = 0;
 
             await update.downloadAndInstall((event) => {
+                console.log("Update event:", event);
                 switch (event.event) {
                     case 'Started':
                         contentLength = event.data.contentLength || 0;
+                        status = `Downloading... (${(contentLength / 1024 / 1024).toFixed(2)} MB)`;
                         break;
                     case 'Progress':
                         downloadedBytes += event.data.chunkLength;
                         if (contentLength > 0) {
                             progress = (downloadedBytes / contentLength) * 100;
+                            status = `Downloading... ${Math.round(progress)}%`;
+                        } else {
+                            status = `Downloading... ${(downloadedBytes / 1024 / 1024).toFixed(2)} MB`;
                         }
                         break;
                     case 'Finished':
@@ -66,7 +71,7 @@
                 }
             });
 
-            status = 'Restarting...';
+            status = 'Restarting app...';
             await relaunch();
         } else {
             status = 'Up to date';
@@ -74,9 +79,11 @@
         }
     } catch (err) {
         console.error("Update error:", err);
-        // If check fails (e.g. signature error, network), we skip update
-        status = 'Starting VOID...';
-        setTimeout(onComplete, 1000);
+        // Show error to user
+        status = `Error: ${err}`;
+        error = String(err);
+        // Wait longer so user can see the error
+        setTimeout(onComplete, 3000);
     }
   }
 </script>
@@ -116,7 +123,7 @@
       
       <!-- Footer Version -->
       <div class="absolute bottom-4 text-gray-600 text-[10px] font-mono tracking-widest opacity-50">
-          v2.1.0
+          v2.1.1
       </div>
   </div>
 </div>
