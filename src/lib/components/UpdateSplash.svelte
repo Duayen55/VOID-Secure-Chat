@@ -115,8 +115,8 @@
       {/if}
       
       <!-- Footer Version -->
-      <div class="absolute bottom-8 text-gray-700 text-[10px] font-mono">
-          v0.1.1 <!-- Should be dynamic in real app -->
+      <div class="absolute bottom-4 text-gray-600 text-[10px] font-mono tracking-widest opacity-50">
+          v2.1.0
       </div>
   </div>
 </div>
