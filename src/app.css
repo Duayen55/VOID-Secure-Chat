@@ -1,1 +1,45 @@
 @import "tailwindcss";
+
+:root {
+  --color-obsidian: #0A0E14;
+  --color-surface: #11151C; /* Slightly lighter than obsidian */
+  --color-surface-hover: #1A1F29;
+  --color-accent: #00E5FF; /* Cyan */
+  --color-text-primary: #E2E8F0;
+  --color-text-secondary: #94A3B8;
+}
+
+body {
+  background-color: var(--color-obsidian);
+  color: var(--color-text-primary);
+  font-family: 'Inter', system-ui, sans-serif;
+  overflow: hidden; /* Prevent global scroll */
+}
+
+/* Custom Utilities */
+.bg-obsidian { background-color: var(--color-obsidian); }
+.bg-surface { background-color: var(--color-surface); }
+.bg-surface-hover { background-color: var(--color-surface-hover); }
+.text-accent { color: var(--color-accent); }
+.border-surface { border-color: rgba(255, 255, 255, 0.05); }
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Animations */
+.transition-fast {
+  transition: all 150ms ease-out;
+}

@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { settings } from './stores';
+import { settings, isSpeaking as isSpeakingStore } from './stores';
 
 // --- Ringtone Logic ---
 let ringToneContext: AudioContext | null = null;
@@ -59,6 +59,11 @@ export class AudioEngine {
     private gainNode: GainNode;
     private analyser: AnalyserNode;
     private stream: MediaStream | null = null;
+    private currentConstraints: MediaTrackConstraints | boolean = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+    };
     
     // State
     private isPTT: boolean = false;
@@ -91,6 +96,42 @@ export class AudioEngine {
         return () => this.speakingListeners.delete(cb);
     }
 
+    private lastSignalTime: number = Date.now();
+    private watchdogTimer: any = null;
+
+    public startWatchdog() {
+        if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+        this.lastSignalTime = Date.now();
+        console.log("[AudioEngine] Watchdog started");
+
+        this.watchdogTimer = setInterval(async () => {
+            if (this.isMuted) {
+                this.lastSignalTime = Date.now(); // Reset timer while muted
+                return;
+            }
+
+            const silenceDuration = Date.now() - this.lastSignalTime;
+            
+            if (silenceDuration > 5000) {
+                 console.warn("[AudioEngine] Watchdog: CRITICAL SILENCE detected (5s). Rolling back.");
+                 await this.rollback();
+                 this.lastSignalTime = Date.now();
+            } else if (silenceDuration > 3000) {
+                 console.warn("[AudioEngine] Watchdog: Silence detected (3s). Restarting.");
+                 const success = await this.restart(this.currentConstraints);
+                 if (success) this.lastSignalTime = Date.now();
+            }
+        }, 1000);
+    }
+
+    public stopWatchdog() {
+        if (this.watchdogTimer) {
+            clearInterval(this.watchdogTimer);
+            this.watchdogTimer = null;
+            console.log("[AudioEngine] Watchdog stopped");
+        }
+    }
+
     constructor() {
         this.context = new (window.AudioContext || (window as any).webkitAudioContext)();
         this.destination = this.context.createMediaStreamDestination();
@@ -110,6 +151,8 @@ export class AudioEngine {
     }
 
     async setInput(audioConstraints: MediaTrackConstraints | boolean) {
+        this.currentConstraints = audioConstraints;
+
         if (this.stream) {
             this.stream.getTracks().forEach(t => t.stop());
         }
@@ -127,7 +170,21 @@ export class AudioEngine {
             await this.context.resume();
         }
 
+        this.startWatchdog();
+
         return this.destination.stream;
+    }
+
+    stopInput() {
+        this.stopWatchdog();
+        if (this.stream) {
+            this.stream.getTracks().forEach(t => t.stop());
+            this.stream = null;
+        }
+        if (this.source) {
+            this.source.disconnect();
+            this.source = null;
+        }
     }
 
     getProcessedStream() {
@@ -138,12 +195,155 @@ export class AudioEngine {
         return this.stream;
     }
 
-    updateSettings(s: any) {
+    async restart(newConstraints: MediaTrackConstraints | boolean): Promise<boolean> {
+        console.log("[AudioEngine] Restarting/Updating with:", newConstraints);
+        const previousMute = this.isMuted;
+        
+        // Try to apply constraints first without stopping stream
+        if (this.stream && this.stream.active && typeof newConstraints === 'object') {
+            const track = this.stream.getAudioTracks()[0];
+            if (track) {
+                try {
+                    // Check if deviceId changed - if so, we MUST restart
+                    const currentSettings = track.getSettings();
+                    const newDeviceId = (newConstraints as any).deviceId;
+                    
+                    if (!newDeviceId || (newDeviceId.exact === currentSettings.deviceId) || (newDeviceId === currentSettings.deviceId)) {
+                         console.log("[AudioEngine] Applying constraints to existing track...");
+                         await track.applyConstraints(newConstraints);
+                         this.currentConstraints = newConstraints;
+                         return true;
+                    }
+                } catch (e) {
+                    console.warn("[AudioEngine] applyConstraints failed, falling back to full restart", e);
+                }
+            }
+        }
+
+        this.setMute(true); // Temp mute
+
+        try {
+            // Stop existing input
+            if (this.stream) {
+                this.stream.getTracks().forEach(t => t.stop());
+            }
+            if (this.source) {
+                this.source.disconnect();
+            }
+
+            // Get new stream
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: newConstraints });
+            
+            // Connect
+            const source = this.context.createMediaStreamSource(stream);
+            source.connect(this.analyser);
+            
+            // Resume context if needed
+            if (this.context.state === 'suspended') await this.context.resume();
+
+            // Validate Signal (2 seconds)
+            const isValid = await this.validateSignal(2000);
+            
+            if (isValid) {
+                console.log("[AudioEngine] Restart success");
+                this.stream = stream;
+                this.source = source;
+                this.currentConstraints = newConstraints;
+                this.setMute(previousMute); 
+                return true;
+            } else {
+                console.warn("[AudioEngine] No signal detected, rolling back...");
+                stream.getTracks().forEach(t => t.stop());
+                throw new Error("No signal detected");
+            }
+
+        } catch (err) {
+            console.error("[AudioEngine] Restart failed:", err);
+            await this.rollback();
+            this.setMute(previousMute);
+            return false;
+        }
+    }
+
+    private async rollback() {
+        try {
+            console.log("[AudioEngine] Rolling back to:", this.currentConstraints);
+            if (this.stream) {
+                this.stream.getTracks().forEach(t => t.stop());
+            }
+            this.stream = await navigator.mediaDevices.getUserMedia({ audio: this.currentConstraints });
+            this.source = this.context.createMediaStreamSource(this.stream);
+            this.source.connect(this.analyser);
+        } catch (e) {
+            console.error("[AudioEngine] Rollback CRITICAL FAILURE", e);
+        }
+    }
+
+    private validateSignal(durationMs: number): Promise<boolean> {
+        return new Promise(resolve => {
+            const start = Date.now();
+            const check = () => {
+                if (Date.now() - start > durationMs) {
+                    resolve(false); 
+                    return;
+                }
+                
+                if (!this.analyser) { resolve(false); return; }
+
+                const bufferLength = this.analyser.frequencyBinCount;
+                const data = new Uint8Array(bufferLength);
+                this.analyser.getByteTimeDomainData(data);
+                
+                let hasSignal = false;
+                for(let i=0; i<bufferLength; i++) {
+                    if (Math.abs(data[i] - 128) > 2) { 
+                        hasSignal = true;
+                        break;
+                    }
+                }
+                
+                if (hasSignal) {
+                    resolve(true);
+                } else {
+                    requestAnimationFrame(check);
+                }
+            };
+            check();
+        });
+    }
+
+    isHealthy(): boolean {
+        return this.context.state === 'running' && !!this.stream && this.stream.active;
+    }
+
+    async updateSettings(s: any) {
         this.isPTT = s.isPTTEnabled;
         this.gateThreshold = s.noiseGateThreshold;
         this.micGain = s.micGain !== undefined ? s.micGain : 1.0;
-        // Re-apply mute logic immediately
-        this.updateGain();
+        
+        // Check for constraint changes
+        const newConstraints = {
+            deviceId: s.selectedMicId ? { exact: s.selectedMicId } : undefined,
+            noiseSuppression: s.noiseSuppression,
+            echoCancellation: s.echoCancellation,
+            autoGainControl: s.autoGainControl
+        };
+
+        // Deep compare (simple version)
+        const current = this.currentConstraints as any;
+        const changed = 
+            (newConstraints.noiseSuppression !== current.noiseSuppression) ||
+            (newConstraints.echoCancellation !== current.echoCancellation) ||
+            (newConstraints.autoGainControl !== current.autoGainControl) ||
+            (JSON.stringify(newConstraints.deviceId) !== JSON.stringify(current.deviceId));
+
+        if (changed) {
+             console.log("[AudioEngine] Constraints changed, restarting...", newConstraints);
+             await this.restart(newConstraints);
+        } else {
+             // Re-apply mute logic immediately if no restart
+             this.updateGain();
+        }
     }
 
     setPTTActive(active: boolean) {
@@ -190,6 +390,11 @@ export class AudioEngine {
             const rms = Math.sqrt(sum / bufferLength);
             const db = 20 * Math.log10(rms + 0.00001);
 
+            // Watchdog Signal Check (Threshold ~ -60dB)
+            if (rms > 0.001) {
+                this.lastSignalTime = Date.now();
+            }
+
             let isGated = false;
 
             if (!this.isMuted) {
@@ -217,6 +422,7 @@ export class AudioEngine {
             if (isSpeaking !== this.wasSpeaking) {
                 this.wasSpeaking = isSpeaking;
                 this.speakingListeners.forEach(cb => cb(isSpeaking));
+                isSpeakingStore.set(isSpeaking);
             }
 
             this.levelListeners.forEach(cb => cb(db, isGated));
@@ -227,6 +433,7 @@ export class AudioEngine {
     }
 
     cleanup() {
+        this.stopWatchdog();
         if (this.stream) this.stream.getTracks().forEach(t => t.stop());
         this.context.close();
     }

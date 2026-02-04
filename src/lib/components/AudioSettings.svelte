@@ -4,37 +4,40 @@
   import { audioEngine } from '$lib/audio';
 
   export let show = true;
-
-  // Dispatcher for external integration if needed
   const dispatch = createEventDispatcher();
 
   // --- State ---
   let microphones: MediaDeviceInfo[] = [];
   let speakers: MediaDeviceInfo[] = [];
   
-  // Noise Gate Runtime State
-  let currentLevel = -100; // dB
+  let currentLevel = -100;
   let isGated = false;
-
-  // Monitoring
-  let monitorAudio = false; // Toggle to hear yourself
+  let monitorAudio = false;
   let audioOutputElement: HTMLAudioElement;
-
-  // Visualizer
   let canvas: HTMLCanvasElement;
   let canvasCtx: CanvasRenderingContext2D | null = null;
-  
-  // Key listening for PTT bind
   let isListeningForKey = false;
-  
-  // Profile Management
   let newProfileName = "";
-  
   let cleanupLevelListener: () => void;
+
+  // --- Pending Hardware State ---
+  let pendingMicId = "";
+  let pendingSpeakerId = "";
+  let pendingNC = true;
+  let pendingEC = true;
+  let pendingAGC = false;
+  let isApplying = false;
 
   onMount(async () => {
     await getDevices();
     navigator.mediaDevices.addEventListener('devicechange', getDevices);
+    
+    // Init pending state
+    pendingMicId = $settings.selectedMicId || (microphones[0]?.deviceId ?? "");
+    pendingSpeakerId = $settings.selectedSpeakerId || (speakers[0]?.deviceId ?? "");
+    pendingNC = $settings.noiseSuppression;
+    pendingEC = $settings.echoCancellation;
+    pendingAGC = $settings.autoGainControl;
     
     // Use AudioEngine
     cleanupLevelListener = audioEngine.addLevelListener((db, gated) => {
@@ -43,12 +46,90 @@
         drawVisualizer(db);
     });
     
-    // Apply initial settings including gain
     audioEngine.updateSettings($settings);
-    restartEngine();
+    // Initial start
+    restartEngine(); 
   });
 
-  // ... (rest of lifecycle)
+  onDestroy(() => {
+    if (cleanupLevelListener) cleanupLevelListener();
+    navigator.mediaDevices.removeEventListener('devicechange', getDevices);
+  });
+
+  async function getDevices() {
+    try {
+      const permStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      permStream.getTracks().forEach(t => t.stop());
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      microphones = devices.filter(d => d.kind === 'audioinput');
+      speakers = devices.filter(d => d.kind === 'audiooutput');
+
+      if (!$settings.selectedMicId && microphones.length > 0) {
+          $settings.selectedMicId = microphones[0].deviceId;
+          pendingMicId = microphones[0].deviceId;
+      }
+      if (!$settings.selectedSpeakerId && speakers.length > 0) {
+          $settings.selectedSpeakerId = speakers[0].deviceId;
+          pendingSpeakerId = speakers[0].deviceId;
+      }
+    } catch (err) {
+      console.error("Error enumerating devices:", err);
+    }
+  }
+
+  async function restartEngine() {
+      const micId = $settings.selectedMicId;
+      if (!micId) return;
+      const constraints = {
+        audio: {
+          deviceId: { exact: micId },
+          noiseSuppression: $settings.noiseSuppression,
+          echoCancellation: $settings.echoCancellation,
+          autoGainControl: $settings.autoGainControl
+        }
+      };
+      await audioEngine.restart(constraints.audio);
+  }
+
+  // Check changes
+  $: hasChanges = pendingMicId !== $settings.selectedMicId || 
+                  pendingNC !== $settings.noiseSuppression || 
+                  pendingEC !== $settings.echoCancellation || 
+                  pendingAGC !== $settings.autoGainControl ||
+                  pendingSpeakerId !== $settings.selectedSpeakerId;
+
+  async function applyChanges() {
+      if (isApplying) return;
+      isApplying = true;
+      
+      const constraints = {
+          audio: {
+              deviceId: { exact: pendingMicId },
+              noiseSuppression: pendingNC,
+              echoCancellation: pendingEC,
+              autoGainControl: pendingAGC
+          }
+      };
+      
+      const success = await audioEngine.restart(constraints.audio);
+      
+      if (success) {
+          $settings.selectedMicId = pendingMicId;
+          $settings.noiseSuppression = pendingNC;
+          $settings.echoCancellation = pendingEC;
+          $settings.autoGainControl = pendingAGC;
+          $settings.selectedSpeakerId = pendingSpeakerId;
+      } else {
+          pendingMicId = $settings.selectedMicId;
+          pendingNC = $settings.noiseSuppression;
+          pendingEC = $settings.echoCancellation;
+          pendingAGC = $settings.autoGainControl;
+          pendingSpeakerId = $settings.selectedSpeakerId;
+          alert("Failed to apply settings. Reverted.");
+      }
+      isApplying = false;
+  }
 
   // Profile Logic
   function createProfile() {
@@ -87,9 +168,6 @@
       const idx = $settings.profiles.findIndex(p => p.id === $settings.activeProfileId);
       if (idx !== -1) {
           const p = $settings.profiles[idx];
-          // Check if changed to avoid loops? Svelte store update might trigger loop if not careful.
-          // But here we are mutating the array inside the store.
-          // We only want to update if values differ.
           if (p.isPTTEnabled !== $settings.isPTTEnabled || 
               p.noiseGateThreshold !== $settings.noiseGateThreshold || 
               p.micGain !== $settings.micGain) {
@@ -106,62 +184,10 @@
       }
   }
   
-  // Sync AudioEngine when settings change (including Gain/Ducking)
   $: {
       audioEngine.updateSettings($settings);
   }
 
-  onDestroy(() => {
-    if (cleanupLevelListener) cleanupLevelListener();
-    navigator.mediaDevices.removeEventListener('devicechange', getDevices);
-  });
-
-  async function getDevices() {
-    try {
-      // Request permission first to get labels
-      // Note: This might interfere with running AudioEngine if not careful, 
-      // but usually okay to request transient stream
-      const permStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      permStream.getTracks().forEach(t => t.stop());
-
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      microphones = devices.filter(d => d.kind === 'audioinput');
-      speakers = devices.filter(d => d.kind === 'audiooutput');
-
-      // Set defaults if not set in store
-      if (!$settings.selectedMicId && microphones.length > 0) {
-          $settings.selectedMicId = microphones[0].deviceId;
-      }
-      if (!$settings.selectedSpeakerId && speakers.length > 0) {
-          $settings.selectedSpeakerId = speakers[0].deviceId;
-      }
-    } catch (err) {
-      console.error("Error enumerating devices:", err);
-    }
-  }
-
-  async function restartEngine() {
-      if (!$settings.selectedMicId) return;
-      const constraints = {
-        audio: {
-          deviceId: { exact: $settings.selectedMicId },
-          noiseSuppression: $settings.noiseSuppression,
-          echoCancellation: $settings.echoCancellation,
-          autoGainControl: $settings.autoGainControl
-        }
-      };
-      await audioEngine.setInput(constraints.audio);
-  }
-
-  // Watch for setting changes that require restart
-  $: if ($settings.selectedMicId || $settings.noiseSuppression || $settings.echoCancellation || $settings.autoGainControl) {
-      // Debounce or just call? For now direct call.
-      // But only if we are "active" (e.g. in this view or call). 
-      // Actually, if we change mic in settings, we WANT it to change globally.
-      restartEngine();
-  }
-  
-  // PTT Key Bind
   function startKeyListen() {
       isListeningForKey = true;
       window.addEventListener('keydown', handleKeyBind);
@@ -184,39 +210,25 @@
      
      canvasCtx.clearRect(0, 0, width, height);
      
-     // DB range: -60 to 0 (approx)
-     // Normalize to 0-1
      let t = (db + 60) / 60; 
      if (t < 0) t = 0;
      if (t > 1) t = 1;
      
      const barWidth = width * t;
      
-     canvasCtx.fillStyle = isGated ? '#ef4444' : '#22c55e'; // Red if gated, Green if open
+     canvasCtx.fillStyle = isGated ? '#ef4444' : '#22c55e';
      canvasCtx.fillRect(0, 0, barWidth, height);
      
-     // Draw Threshold Line
      const threshT = ($settings.noiseGateThreshold + 60) / 60;
      const threshX = width * threshT;
      
      canvasCtx.fillStyle = '#ffffff';
      canvasCtx.fillRect(threshX, 0, 2, height);
 
-     // Text Info
      canvasCtx.fillStyle = '#fff';
      canvasCtx.font = '10px sans-serif';
      canvasCtx.fillText(`Level: ${currentLevel.toFixed(1)} dB`, 5, 12);
      canvasCtx.fillText(`Gate: ${$settings.noiseGateThreshold} dB`, threshX + 5, 12);
-  }
-
-  // Handle changes
-  function handleConstraintChange() {
-    // Restart to apply constraints reliably
-    restartEngine();
-  }
-  
-  function handleDeviceChange() {
-      restartEngine();
   }
 
   $: if (audioOutputElement) {
@@ -236,10 +248,9 @@
       // @ts-ignore
       audioOutputElement.setSinkId($settings.selectedSpeakerId).catch(e => console.warn(e));
   }
-
 </script>
 
-<div class="bg-gray-900 text-gray-200 p-6 rounded-xl w-full max-w-2xl mx-auto shadow-xl border border-gray-700">
+<div class="bg-gray-900 text-gray-200 p-6 rounded-xl w-full max-w-2xl mx-auto shadow-xl border border-gray-700 relative">
     <div class="mb-6 border-b border-gray-700 pb-4">
         <h2 class="text-xl font-bold text-white flex items-center">
             <span class="mr-2">🎙️</span> Audio Settings
@@ -247,7 +258,7 @@
         <p class="text-sm text-gray-400 mt-1">Configure input, output, and processing.</p>
     </div>
 
-    <div class="space-y-6">
+    <div class="space-y-6 pb-16">
         <!-- Game Profiles -->
         <div class="bg-blue-900/20 rounded-lg p-4 border border-blue-500/30">
             <div class="flex justify-between items-center mb-3">
@@ -296,14 +307,13 @@
             </div>
         </div>
 
-        <!-- Device Selection -->
+        <!-- Device Selection (Bound to Pending) -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <!-- Microphone -->
             <div class="space-y-2">
                 <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400">Microphone</label>
                 <select 
-                    bind:value={$settings.selectedMicId} 
-                    on:change={handleDeviceChange}
+                    bind:value={pendingMicId} 
                     class="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none text-white"
                 >
                     {#each microphones as mic}
@@ -316,7 +326,7 @@
             <div class="space-y-2">
                 <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400">Speaker</label>
                 <select 
-                    bind:value={$settings.selectedSpeakerId} 
+                    bind:value={pendingSpeakerId} 
                     class="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none text-white"
                 >
                     {#each speakers as speaker}
@@ -357,20 +367,20 @@
             </div>
         </div>
 
-        <!-- Processing Features -->
+        <!-- Processing Features (Bound to Pending) -->
         <div class="bg-gray-800/50 rounded-lg p-4 space-y-3 border border-gray-700/50">
             <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Enhancements</label>
             <div class="flex flex-wrap gap-4">
                 <label class="flex items-center space-x-2 cursor-pointer select-none">
-                    <input type="checkbox" bind:checked={$settings.noiseSuppression} on:change={handleConstraintChange} class="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500/50">
+                    <input type="checkbox" bind:checked={pendingNC} class="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500/50">
                     <span class="text-sm">Noise Suppression</span>
                 </label>
                 <label class="flex items-center space-x-2 cursor-pointer select-none">
-                    <input type="checkbox" bind:checked={$settings.echoCancellation} on:change={handleConstraintChange} class="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500/50">
+                    <input type="checkbox" bind:checked={pendingEC} class="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500/50">
                     <span class="text-sm">Echo Cancellation</span>
                 </label>
                 <label class="flex items-center space-x-2 cursor-pointer select-none">
-                    <input type="checkbox" bind:checked={$settings.autoGainControl} on:change={handleConstraintChange} class="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500/50">
+                    <input type="checkbox" bind:checked={pendingAGC} class="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500/50">
                     <span class="text-sm">Auto Gain</span>
                 </label>
             </div>
@@ -467,4 +477,36 @@
         <!-- Hidden Audio Element for Monitoring -->
         <audio bind:this={audioOutputElement} class="hidden"></audio>
     </div>
+
+    <!-- Apply Changes Floating Bar -->
+    {#if hasChanges}
+        <div class="absolute bottom-6 left-6 right-6 p-4 bg-green-900/90 backdrop-blur border border-green-500/50 rounded-xl shadow-2xl flex items-center justify-between animate-fade-in-up">
+            <div class="text-green-100">
+                <h4 class="font-bold text-sm">Unsaved Changes</h4>
+                <p class="text-xs opacity-80">Audio restart required.</p>
+            </div>
+            <div class="flex gap-2">
+                <button 
+                    on:click={() => {
+                        // Reset to current
+                        pendingMicId = $settings.selectedMicId;
+                        pendingNC = $settings.noiseSuppression;
+                        pendingEC = $settings.echoCancellation;
+                        pendingAGC = $settings.autoGainControl;
+                        pendingSpeakerId = $settings.selectedSpeakerId;
+                    }}
+                    class="px-3 py-1.5 text-xs font-medium text-green-200 hover:text-white hover:bg-green-800/50 rounded-lg transition-colors"
+                >
+                    Reset
+                </button>
+                <button 
+                    on:click={applyChanges}
+                    disabled={isApplying}
+                    class="px-4 py-1.5 text-xs font-bold bg-green-500 hover:bg-green-400 text-black rounded-lg shadow-lg transition-transform active:scale-95 disabled:opacity-50"
+                >
+                    {isApplying ? 'Applying...' : 'Apply Now'}
+                </button>
+            </div>
+        </div>
+    {/if}
 </div>

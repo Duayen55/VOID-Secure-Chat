@@ -48,13 +48,22 @@
   let position = { x: 20, y: 80 };
   let isDragging = false;
   let dragOffset = { x: 0, y: 0 };
+  
+  // Embedded Mode
+  export let embedded = false;
 
   // --- Sync State ---
   let syncUnsub: (() => void) | null = null;
   let lastSyncUpdate = 0;
-  let syncLatencyThreshold = 3; // seconds
-  let isRemoteUpdate = false; // Prevent echo loops
-  let ytTimer: any = null; // Fake timer for YouTube
+  let syncLatencyThreshold = 0.5; // Reduced for tighter sync
+  let isRemoteUpdate = false; 
+  let lastServerStateStr = ""; // To prevent processing stale updates
+  let ytTimer: any = null;
+  let animationFrame: any = null;
+  
+  // Anchor Point State (Host Authority)
+  let anchorTime = 0; // The timestamp when the track started/resumed (Server Time / Host Time)
+  let anchorPosition = 0; // The track position at anchorTime
   
   // --- Ducking State ---
   let duckingFactor = tweened(1.0, { duration: 300, easing: cubicOut });
@@ -63,8 +72,35 @@
 
   // --- Persistence ---
   const STORAGE_KEY = 'void_music_player_settings';
+  const DEBUG = true; // Enabled for debugging as requested
+
+  function log(msg: string, data?: any) {
+      if (DEBUG) console.log(`[Music] ${msg}`, data || '');
+  }
+
+  function sendYT(func: string, args: any[] = []) {
+      // 1. Check strict conditions
+      if (!playlist[currentTrackIndex]?.isYouTube) return;
+      if (!ytIframe) return;
+      if (typeof window === 'undefined') return;
+
+      // 2. Debug Log
+      log("sendYT", { func, args });
+
+      // 3. Safe Execution
+      try {
+          ytIframe.contentWindow?.postMessage(JSON.stringify({
+              event: 'command',
+              func: func,
+              args: args
+          }), '*');
+      } catch (e) {
+          console.warn("[Music] sendYT error", e);
+      }
+  }
 
   onMount(() => {
+    log("initialized");
     // Load settings
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
@@ -114,11 +150,9 @@
   
   // Update YouTube volume if active
   $: if (playlist[currentTrackIndex]?.isYouTube && effectiveVolume !== undefined) {
-      // Debounce slightly or just send? PostMessage is cheap.
-      // But we need to ensure player is ready.
-      // We'll rely on the interval or just send it.
       const vol = Math.max(0, Math.min(100, effectiveVolume * 100));
-      sendYT('setVolume', vol);
+      // Safe call via helper
+      sendYT('setVolume', [vol]);
   }
 
   // Watch volume to persist (Raw volume only)
@@ -151,13 +185,7 @@
                  onEnded();
              }
              // Re-apply volume on state change (e.g. start)
-             if (ytIframe && typeof window !== 'undefined') {
-                 ytIframe.contentWindow?.postMessage(JSON.stringify({
-                    event: 'command',
-                    func: 'setVolume',
-                    args: [volume * 100]
-                 }), '*');
-             }
+             sendYT('setVolume', [volume * 100]);
           }
 
           // YouTube often sends 'infoDelivery' with info.duration
@@ -202,23 +230,38 @@
 
   function subscribeToSync(chatId: string) {
       if (syncUnsub) syncUnsub();
-      console.log("Subscribing to music sync for chat:", chatId);
+      lastServerStateStr = ""; // Reset on new subscription
       
       syncUnsub = onSnapshot(doc(db, "chats", chatId), (snap) => {
           const data = snap.data();
           if (data?.musicStatus) {
+              // Deduplication: Ignore if state is identical to what we last processed
+              // This prevents stale updates (e.g. from unrelated doc changes) from reverting local optimistic updates
+              const currentStatusStr = JSON.stringify(data.musicStatus);
+              if (currentStatusStr === lastServerStateStr) return;
+
+              // Always apply sync if we are not the updater
               if (data.musicStatus.updatedBy !== $user?.uid) {
                   applySyncState(data.musicStatus);
+                  lastServerStateStr = currentStatusStr;
               }
           }
       });
   }
 
-  async function broadcastState(force = false) {
+  // Fire-and-forget broadcast (Optimistic UI)
+  function broadcastState(force = false) {
       if (!activeChat || !$user || isRemoteUpdate) return;
       
       const track = playlist[currentTrackIndex];
       if (!track) return;
+
+      // Calculate Anchor
+      // If playing, Anchor Time is Now, Anchor Position is Current Time
+      // This establishes a new reference point
+      const now = Date.now();
+      anchorTime = now;
+      anchorPosition = currentTime;
 
       const state = {
           updatedBy: $user.uid,
@@ -227,37 +270,37 @@
           trackArtist: track.artist,
           trackUrl: track.url,
           isYouTube: track.isYouTube || false,
-          duration: track.duration || duration || 0, // Sync duration
-          currentTime,
-          timestamp: serverTimestamp() 
+          duration: track.duration || duration || 0,
+          anchorTime: serverTimestamp(), // Use server time for reference
+          anchorPosition, 
+          // We DO NOT send currentTime. Clients calculate it.
+          playbackSpeed: 1.0 
       };
 
-      try {
-          const now = Date.now();
-          if (force || now - lastSyncUpdate > 1000 || !isPlaying) {
-             await updateDoc(doc(db, "chats", activeChat.chatId), {
-                 musicStatus: state
-             });
-             lastSyncUpdate = now;
-          }
-      } catch(e) { console.warn("Sync error", e); }
+      // No await - fire and forget
+      updateDoc(doc(db, "chats", activeChat.chatId), {
+          musicStatus: state
+      }).catch(e => console.warn("Sync failed:", e));
+      
+      lastSyncUpdate = now;
   }
 
   function applySyncState(state: any) {
       isRemoteUpdate = true;
+      const now = Date.now();
+
       // 1. Check Track
       if (state.trackUrl !== playlist[currentTrackIndex]?.url) {
           const existingIdx = playlist.findIndex(t => t.url === state.trackUrl);
           if (existingIdx !== -1) {
               currentTrackIndex = existingIdx;
-              // Update duration if we have it now
               if (state.duration > 0) {
                   playlist[currentTrackIndex].duration = state.duration;
                   duration = state.duration;
               }
           } else {
               playlist = [...playlist, {
-                  id: 'sync-' + Date.now(),
+                  id: 'sync-' + now,
                   title: state.trackTitle || 'Synced Track',
                   artist: state.trackArtist || 'Remote',
                   url: state.trackUrl,
@@ -267,46 +310,52 @@
               currentTrackIndex = playlist.length - 1;
               if (state.duration > 0) duration = state.duration;
           }
-      } else {
-          // Same track, but maybe we got duration update
-          if (state.duration > 0 && (!playlist[currentTrackIndex].duration || playlist[currentTrackIndex].duration === 0)) {
-               playlist[currentTrackIndex].duration = state.duration;
-               duration = state.duration;
-          }
       }
 
-      // 2. Play/Pause
+      // 2. Play/Pause State
       if (state.isPlaying !== isPlaying) {
           isPlaying = state.isPlaying;
           if (audio && !state.isYouTube) {
               isPlaying ? audio.play().catch(() => {}) : audio.pause();
           }
-      }
-
-      // 3. Time Sync
-      if (state.timestamp && !state.isYouTube) { 
-          const serverTime = state.timestamp.toMillis ? state.timestamp.toMillis() : Date.now();
-          const now = Date.now();
-          const elapsed = (now - serverTime) / 1000;
-          const targetTime = state.currentTime + elapsed;
-
-          if (audio && Math.abs(audio.currentTime - targetTime) > syncLatencyThreshold) {
-               audio.currentTime = targetTime;
+          if (state.isYouTube) {
+               isPlaying ? startYTTimer() : stopYTTimer();
           }
       }
 
-      // 4. YouTube Time Sync
-      if (state.isYouTube && ytIframe) {
-          if (Math.abs(currentTime - state.currentTime) > 5) {
-               currentTime = state.currentTime;
-               ytIframe.contentWindow?.postMessage(JSON.stringify({
-                   event: 'command',
-                   func: 'seekTo',
-                   args: [currentTime, true]
-               }), '*');
+      // 3. Deterministic Time Sync (Drift Calculation)
+      if (state.anchorTime) {
+          // Convert Server Timestamp to Millis
+          const serverTime = state.anchorTime.toMillis ? state.anchorTime.toMillis() : now;
+          
+          // Calculate Target Time
+          // Target = AnchorPos + (IsPlaying ? (Now - ServerAnchorTime) : 0)
+          let targetTime = state.anchorPosition;
+          
+          if (state.isPlaying) {
+              const elapsed = (now - serverTime) / 1000;
+              targetTime += elapsed * (state.playbackSpeed || 1.0);
           }
-          if (state.isPlaying) startYTTimer();
-          else stopYTTimer();
+
+          // Apply Drift Correction
+          const drift = Math.abs(currentTime - targetTime);
+          
+          if (drift > syncLatencyThreshold) {
+              console.log(`[Sync] Drift detected: ${drift.toFixed(3)}s. Seeking to ${targetTime.toFixed(3)}s`);
+              currentTime = targetTime;
+              
+              if (audio && !state.isYouTube) {
+                  audio.currentTime = currentTime;
+              }
+              
+              if (state.isYouTube && ytIframe) {
+                   ytIframe.contentWindow?.postMessage(JSON.stringify({
+                       event: 'command',
+                       func: 'seekTo',
+                       args: [currentTime, true]
+                   }), '*');
+              }
+          }
       }
 
       isRemoteUpdate = false;
@@ -353,11 +402,9 @@
 
   function startYTTimer() {
       stopYTTimer();
+      // Local timer for UI progress only
       ytTimer = setInterval(() => {
           if (duration === 0 || currentTime < duration) currentTime += 1;
-          if (activeChat && Date.now() - lastSyncUpdate > 5000) {
-              broadcastState();
-          }
       }, 1000);
   }
 
@@ -367,6 +414,7 @@
   }
 
   function handleSeek() {
+      // Optimistic update
       if (audio) audio.currentTime = currentTime;
       if (playlist[currentTrackIndex]?.isYouTube && ytIframe) {
           ytIframe.contentWindow?.postMessage(JSON.stringify({
@@ -375,6 +423,7 @@
               args: [currentTime, true]
           }), '*');
       }
+      // Broadcast new anchor immediately
       broadcastState();
   }
 
@@ -439,12 +488,7 @@
         playlist[currentTrackIndex].duration = duration;
     }
     
-    if (isPlaying && activeChat) {
-        const now = Date.now();
-        if (now - lastSyncUpdate > 5000) { 
-            broadcastState();
-        }
-    }
+    // NO broadcast on timeupdate - relies on Anchor Time
   }
 
   // --- Playlist Management ---
@@ -497,7 +541,7 @@
     }
   }
 
-  async function addFromUrl() {
+  function addFromUrl() {
       if (!inputUrl.trim()) return;
       
       let title = "External Track";
@@ -505,6 +549,7 @@
       let isYT = false;
       let thumbnail = "";
       let finalUrl = inputUrl;
+      let videoId = "";
 
       // Simple YouTube Detection
       if (inputUrl.includes('youtube.com') || inputUrl.includes('youtu.be')) {
@@ -515,35 +560,58 @@
           const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
           const match = inputUrl.match(regExp);
           if (match && match[2].length === 11) {
-              const videoId = match[2];
+              videoId = match[2];
               // Add origin to enable proper JS API support
               const origin = typeof window !== 'undefined' ? window.location.origin : '';
               finalUrl = `https://www.youtube.com/embed/${videoId}?autoplay=1&enablejsapi=1&origin=${origin}`;
               thumbnail = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
-              
-              // Try to fetch metadata via official oEmbed (Most reliable for Title/Author)
-              // We rely on the player itself to update duration once loaded (Atom Mode)
-              try {
-                  const res = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
-                  const data = await res.json();
-                  if (data.title) title = data.title;
-                  if (data.author_name) artist = data.author_name;
-              } catch (err) { console.warn("Metadata fetch failed", err); }
           }
       }
 
-      playlist = [...playlist, {
-          id: crypto.randomUUID(),
+      const newTrackId = crypto.randomUUID();
+      const newTrack: Track = {
+          id: newTrackId,
           title,
           artist,
           url: finalUrl,
           isYouTube: isYT,
           thumbnail,
           duration: isYT ? duration : 0 // Save initial duration
-      }];
+      };
+
+      playlist = [...playlist, newTrack];
       
       inputUrl = "";
       playTrack(playlist.length - 1);
+
+      // Background Fetch Metadata
+      if (isYT && videoId) {
+          fetchYouTubeMetadata(videoId, newTrackId);
+      }
+  }
+
+  async function fetchYouTubeMetadata(videoId: string, trackId: string) {
+      try {
+          const res = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
+          const data = await res.json();
+          
+          // Update playlist
+          playlist = playlist.map(t => {
+              if (t.id === trackId) {
+                  return { 
+                      ...t, 
+                      title: data.title || t.title, 
+                      artist: data.author_name || t.artist 
+                  };
+              }
+              return t;
+          });
+
+          // If currently playing, broadcast update
+          if (playlist[currentTrackIndex]?.id === trackId) {
+              broadcastState();
+          }
+      } catch (err) { console.warn("Metadata fetch failed", err); }
   }
   
   // Control YouTube via postMessage
@@ -610,14 +678,14 @@
     ></audio>
 {/if}
 
-<!-- Floating Player -->
+<!-- Player Container -->
 <div 
-  class="fixed z-[100] bg-[#161A22]/95 backdrop-blur-xl border border-gray-700/50 rounded-2xl shadow-2xl overflow-hidden text-white transition-all ring-1 ring-white/10"
-  style="left: {position.x}px; top: {position.y}px; width: {isMinimized ? '280px' : '340px'}; max-height: 80vh; display: flex; flex-direction: column;"
-  on:mousedown={startDrag}
+  class="{embedded ? 'w-full h-full bg-transparent flex flex-col' : 'fixed z-[100] bg-[#161A22]/95 backdrop-blur-xl border border-gray-700/50 rounded-2xl shadow-2xl ring-1 ring-white/10'} overflow-hidden text-white transition-all"
+  style={embedded ? '' : `left: ${position.x}px; top: ${position.y}px; width: ${isMinimized ? '280px' : '340px'}; max-height: 80vh; display: flex; flex-direction: column;`}
+  on:mousedown={embedded ? null : startDrag}
 >
   <!-- Header (Visible in Mini Mode) -->
-  <div class="p-3 bg-white/5 flex items-center justify-between cursor-move select-none relative border-b border-white/5 shrink-0">
+  <div class="p-3 bg-white/5 flex items-center justify-between {embedded ? '' : 'cursor-move'} select-none relative border-b border-white/5 shrink-0">
     {#if activeChat}
         <div class="absolute top-0 left-0 w-full h-[1px] bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]" title="Syncing with Call"></div>
     {/if}

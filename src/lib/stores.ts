@@ -98,5 +98,8 @@ function createSettingsStore() {
 }
 
 export const settings = createSettingsStore();
+
+export const isSpeaking = writable(false);
 export const user = writable<any>(null);
 export const activeChat = writable<any>(null);
+export const pendingCallAccept = writable<string | null>(null); // Stores chatId to auto-accept on main page
